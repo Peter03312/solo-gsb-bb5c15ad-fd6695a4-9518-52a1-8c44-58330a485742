@@ -3,6 +3,7 @@ const { db, transaction } = require('./db');
 const { badRequest, notFound, forbidden, conflict, wrap } = require('./errors');
 const { authRequired } = require('./auth');
 const { assertPropsAfterScheduleChange } = require('./props');
+const { settlementMarkForSession } = require('./settlements');
 
 /**
  * 排练日程：导演为已有排练的某场次安排带时区的起止时段（同一场次可安排多段）。
@@ -696,6 +697,7 @@ function attendanceSummary(scheduleId) {
   const expected = rows.length;
   const checkedIn = rows.filter((x) => x.checked_in_at).length;
   const counted = a.status !== 'voided';
+  const mark = settlementMarkForSession(a.id);
   return {
     id: a.id,
     status: a.status,
@@ -704,6 +706,8 @@ function attendanceSummary(scheduleId) {
     absent: counted && a.status === 'closed' ? expected - checkedIn : 0,
     counted,
     scheduleCancelled: !!a.schedule_cancelled,
+    settled: mark.settled,
+    settlementId: mark.settlementId,
   };
 }
 

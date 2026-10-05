@@ -3,6 +3,7 @@ const { db, transaction } = require('./db');
 const { badRequest, notFound, forbidden, conflict, wrap } = require('./errors');
 const { authRequired } = require('./auth');
 const { participantDetails } = require('./schedules');
+const { settlementMarkForSession } = require('./settlements');
 
 /**
  * 到场登记：导演为“有效”日程时段开启的一次性到场签到。
@@ -98,6 +99,7 @@ function baseSessionView(session) {
     status: session.status,
     statusLabel: SESSION_STATUS_LABEL[session.status],
     scheduleCancelled: !!session.schedule_cancelled,
+    ...settlementMarkForSession(session.id),
     openedAt: session.opened_at,
     closedAt: session.closed_at,
   };

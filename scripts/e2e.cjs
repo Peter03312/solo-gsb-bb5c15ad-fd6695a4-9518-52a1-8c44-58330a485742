@@ -520,8 +520,8 @@ async function main() {
   const fAtt = (await J(`/api/rehearsals/${rhF}/schedules/${f1.id}/attendance`, director, {}, 201)).session;
   await J(`/api/rehearsals/${rhF}/schedules/${f1.id}/attendance/check-in`, lin, {}, 201);
   await J(batchUrl, director, { items: [
-    { scheduleId: f1.id, startAt: '2032-06-01T10:00:00+08:00', endAt: '2032-06-01T11:00:00+08:00' },
-    { scheduleId: f2.id, startAt: '2032-06-02T10:00:00+08:00', endAt: '2032-06-02T11:00:00+08:00' },
+    { scheduleId: f1.id, startAt: '2036-02-01T10:00:00+08:00', endAt: '2036-02-01T11:00:00+08:00' },
+    { scheduleId: f2.id, startAt: '2036-02-02T10:00:00+08:00', endAt: '2036-02-02T11:00:00+08:00' },
   ] }, 200);
   const fAttAfter = (await G(`/api/rehearsals/${rhF}/schedules/${f1.id}/attendance`, director)).session;
   check('批量改时间不回写登记快照（UTC 时段/版本/签到保留）',
@@ -1871,6 +1871,271 @@ async function main() {
     await req('PUT', `/api/rehearsals/${rhV}/schedules/${vD.id}/substitutes/${roleV}`, director,
       { substituteActorId: zhouId, reason: '已取消' }, 400);
   }
+
+  console.log('— 劳务结算：费率维护与权限 —');
+  {
+    // 初始：全部演员无费率（未设置为 null，区别于显式 0）
+    let rates = (await G('/api/actor-rates', director)).actors;
+    check('费率表列出全部演员且初始未设置',
+      rates.length >= 3 && rates.every((a) => a.rateCentsPerHour === null && a.configured === false),
+      JSON.stringify(rates));
+    await G('/api/actor-rates', lin, 403);
+    await req('PUT', `/api/actors/${linId}/rate`, lin, { rateCentsPerHour: 100 }, 403);
+    check('演员不可查看费率表/维护费率（403）', true);
+    await req('PUT', `/api/actors/${linId}/rate`, director, { rateCentsPerHour: -1 }, 400);
+    await req('PUT', `/api/actors/${linId}/rate`, director, { rateCentsPerHour: 1.5 }, 400);
+    await req('PUT', `/api/actors/99999/rate`, director, { rateCentsPerHour: 100 }, 400);
+    check('费率必须是非负整数、演员须存在（400）', true);
+    // 林晚 36000 分/小时、陈默 45000、周海暂不设置（稍后验证无费率整单拒绝）
+    await req('PUT', `/api/actors/${linId}/rate`, director, { rateCentsPerHour: 36000 }, 200);
+    await req('PUT', `/api/actors/${chenId}/rate`, director, { rateCentsPerHour: 45000 }, 200);
+    rates = (await G('/api/actor-rates', director)).actors;
+    const linRate = rates.find((a) => a.actorId === linId);
+    check('费率写入成功（分与元两种表示）',
+      linRate.rateCentsPerHour === 36000 && linRate.rateYuanPerHour === '360.00' && linRate.configured);
+    const myRate = (await G('/api/me/rate', lin)).rate;
+    check('演员可查看本人费率', myRate.rateCentsPerHour === 36000 && myRate.rateYuanPerHour === '360.00');
+    await G('/api/me/rate', director, 403);
+    check('导演无“本人费率”（403）', true);
+  }
+
+  console.log('— 劳务结算：准备已关闭登记（兼任多角只算一次、缺席不计）—');
+  // 复用 p3 剧本（场次 T1/T2、角色 RX/RY/RZ，v1/v2 均已发布）
+  const rhPay = (await J(`/api/plays/${p3.id}/rehearsals`, director, { versionId: p3v1, name: '结算排练' }, 201)).id;
+  // 当前 RX=林晚、RY=周海（前面改派过）、RZ=周海（前面派过）；重新统一派角：RX=林晚、RY=陈默、RZ=周海
+  await J(`/api/rehearsals/${rhPay}/cast`, director, { roleId: roleX, actorId: linId }, 201);
+  await J(`/api/rehearsals/${rhPay}/cast`, director, { roleId: roleY, actorId: chenId }, 201);
+  await J(`/api/rehearsals/${rhPay}/cast`, director, { roleId: roleZ, actorId: zhouId }, 201);
+  // PAY1：3600 秒（1 小时），林晚+陈默签到、周海缺席
+  const schPay1 = (await J(`/api/rehearsals/${rhPay}/schedules`, director, {
+    sceneId: at1, startAt: '2037-08-01T10:00:00+08:00', endAt: '2037-08-01T11:00:00+08:00',
+  }, 201)).schedule;
+  const pay1 = (await J(`/api/rehearsals/${rhPay}/schedules/${schPay1.id}/attendance`, director, {}, 201)).session;
+  await J(`/api/rehearsals/${rhPay}/schedules/${schPay1.id}/attendance/check-in`, lin, {}, 201);
+  await J(`/api/rehearsals/${rhPay}/schedules/${schPay1.id}/attendance/check-in`, chen, {}, 201);
+  await J(`/api/rehearsals/${rhPay}/schedules/${schPay1.id}/attendance/close`, director, {}, 200);
+  // PAY2：5400 秒（1.5 小时），只林晚签到（陈默缺席）；关闭后再取消日程 -> 仍可结算
+  const schPay2 = (await J(`/api/rehearsals/${rhPay}/schedules`, director, {
+    sceneId: at2, startAt: '2037-08-02T10:00:00+08:00', endAt: '2037-08-02T11:30:00+08:00',
+  }, 201)).schedule;
+  const pay2 = (await J(`/api/rehearsals/${rhPay}/schedules/${schPay2.id}/attendance`, director, {}, 201)).session;
+  await J(`/api/rehearsals/${rhPay}/schedules/${schPay2.id}/attendance/check-in`, lin, {}, 201);
+  await J(`/api/rehearsals/${rhPay}/schedules/${schPay2.id}/attendance/close`, director, {}, 200);
+  await J(`/api/rehearsals/${rhPay}/schedules/${schPay2.id}/cancel`, director, {}, 200);
+  const pay2AfterCancel = (await G(`/api/rehearsals/${rhPay}/schedules/${schPay2.id}/attendance`, director)).session;
+  check('关闭后取消日程：登记仍 closed 且仅标注取消',
+    pay2AfterCancel.status === 'closed' && pay2AfterCancel.scheduleCancelled === true);
+
+  // PAY3：让周海“兼任多角”——为 RX 设替角周海（签到开启前），签到名单含 林晚(RX原) 、陈默(RY)、周海(RX替/RZ常)
+  // 周海在名单中只有一行（参与者合并），只算一次。时长 1800 秒（0.5 小时）
+  const schPay3 = (await J(`/api/rehearsals/${rhPay}/schedules`, director, {
+    sceneId: at1, startAt: '2037-08-03T13:00:00+08:00', endAt: '2037-08-03T13:30:00+08:00',
+  }, 201)).schedule;
+  await req('PUT', `/api/rehearsals/${rhPay}/schedules/${schPay3.id}/substitutes/${roleX}`, director,
+    { substituteActorId: zhouId, reason: '结算测试兼角' }, 200);
+  const pay3 = (await J(`/api/rehearsals/${rhPay}/schedules/${schPay3.id}/attendance`, director, {}, 201)).session;
+  check('兼任多角的周海在冻结名单中只占一行',
+    pay3.roster.filter((m) => m.actorId === zhouId).length === 1
+    && pay3.roster.find((m) => m.actorId === zhouId).roles.length === 2,
+    JSON.stringify(pay3.roster));
+  await J(`/api/rehearsals/${rhPay}/schedules/${schPay3.id}/attendance/check-in`, zhou, {}, 201);
+  await J(`/api/rehearsals/${rhPay}/schedules/${schPay3.id}/attendance/close`, director, {}, 200);
+
+  console.log('— 劳务结算：可结算清单与预演 —');
+  const eligBefore = (await G('/api/settlements/eligible-attendances', director)).sessions;
+  check('可结算清单含三个已关闭登记（含关闭后取消者）、不含作废与开放中',
+    [pay1.id, pay2.id, pay3.id].every((id) => eligBefore.some((s) => s.attendanceSessionId === id)),
+    JSON.stringify(eligBefore.map((s) => s.attendanceSessionId)));
+  check('清单标注缺费率演员（PAY3 的周海尚未设置费率）',
+    eligBefore.find((s) => s.attendanceSessionId === pay3.id).missingRate === true);
+  await G('/api/settlements/eligible-attendances', lin, 403);
+  check('演员不可查看可结算清单（403）', true);
+  // 预演：与创建同一套校验
+  const preview = (await J('/api/settlements/preview', director, {
+    attendanceSessionIds: [pay1.id, pay2.id], note: '预演单',
+  }, 200)).preview;
+  check('预演为只读且金额正确（林晚 36000×1h + 36000×1.5h；陈默 45000×1h）',
+    preview.total.cents === 36000 + 54000 + 45000
+    && preview.entries.length === 3
+    && preview.actorTotals.find((a) => a.actorId === linId).totalCents === 90000
+    && preview.actorTotals.find((a) => a.actorId === chenId).totalCents === 45000,
+    JSON.stringify({ total: preview.total, totals: preview.actorTotals }));
+  // 预演不落库：可结算清单不变
+  const eligAfterPreview = (await G('/api/settlements/eligible-attendances', director)).sessions;
+  check('预演不占用任何登记',
+    [pay1.id, pay2.id].every((id) => eligAfterPreview.some((s) => s.attendanceSessionId === id)));
+
+  console.log('— 劳务结算：无费率/重复/已结算/未关闭 -> 整单拒绝、不占用登记 —');
+  // PAY3 周海无费率 -> 与 PAY1 一起提交也整单拒绝
+  const missRate = await J('/api/settlements', director, { attendanceSessionIds: [pay1.id, pay3.id] }, 400);
+  check('已签到演员无费率整单拒绝（SETTLEMENT_RATE_MISSING）',
+    missRate.error === 'BAD_REQUEST' && missRate.details.code === 'SETTLEMENT_RATE_MISSING'
+    && missRate.details.actors.some((a) => a.actorId === zhouId),
+    JSON.stringify(missRate.details));
+  // 重复选择
+  const payDup = await J('/api/settlements', director, { attendanceSessionIds: [pay1.id, pay1.id] }, 400);
+  check('重复选择登记整单拒绝', payDup.details && payDup.details.code === 'SETTLEMENT_DUPLICATE_SESSION');
+  // 空批次/非数组/非整数
+  await J('/api/settlements', director, { attendanceSessionIds: [] }, 400);
+  await J('/api/settlements', director, { attendanceSessionIds: ['1'] }, 400);
+  await J('/api/settlements', director, {}, 400);
+  // 不存在 / 开放中 / 已作废（“已结算登记 409”在下方造出已结算单后补测）
+  await J('/api/settlements', director, { attendanceSessionIds: [99999] }, 404);
+  const openPay = (await J(`/api/rehearsals/${rhPay}/schedules`, director, {
+    sceneId: at1, startAt: '2037-08-05T10:00:00+08:00', endAt: '2037-08-05T11:00:00+08:00',
+  }, 201)).schedule;
+  const openAtt = (await J(`/api/rehearsals/${rhPay}/schedules/${openPay.id}/attendance`, director, {}, 201)).session;
+  await J('/api/settlements', director, { attendanceSessionIds: [openAtt.id] }, 400);
+  await J('/api/settlements', director, { attendanceSessionIds: [att3.id] }, 400); // att3 已作废
+  check('空批次/非数组/不存在/已结算(409)/开放中/已作废 均整单拒绝', true);
+  // 全部拒绝后 PAY1/PAY3 未被占用（仍可结算、仍在清单中）
+  const eligAfterRejects = (await G('/api/settlements/eligible-attendances', director)).sessions;
+  check('被拒整单不占用任何登记',
+    [pay1.id, pay2.id, pay3.id].every((id) => eligAfterRejects.some((s) => s.attendanceSessionId === id)));
+  await J('/api/settlements', lin, { attendanceSessionIds: [pay1.id] }, 403);
+  check('演员不能生成结算单（403）', true);
+
+  console.log('— 劳务结算：逐人四舍五入到分（费率即结算时费率）—');
+  // 周海费率 1000 分/小时（PAY3 兼角用）；林晚费率改为 100 分/小时：100×100/3600 = 2.777… -> 四舍五入 3 分
+  await req('PUT', `/api/actors/${zhouId}/rate`, director, { rateCentsPerHour: 1000 }, 200);
+  await req('PUT', `/api/actors/${linId}/rate`, director, { rateCentsPerHour: 100 }, 200);
+  const schRound = (await J(`/api/rehearsals/${rhPay}/schedules`, director, {
+    sceneId: at1, startAt: '2037-08-06T10:00:00+08:00', endAt: '2037-08-06T10:01:40+08:00',
+  }, 201)).schedule;
+  const roundAtt = (await J(`/api/rehearsals/${rhPay}/schedules/${schRound.id}/attendance`, director, {}, 201)).session;
+  await J(`/api/rehearsals/${rhPay}/schedules/${schRound.id}/attendance/check-in`, lin, {}, 201);
+  await J(`/api/rehearsals/${rhPay}/schedules/${schRound.id}/attendance/close`, director, {}, 200);
+  check('四舍五入登记时长=100 秒', roundAtt.endAt === '2037-08-06T02:01:40.000Z');
+  const roundSet = (await J('/api/settlements', director, { attendanceSessionIds: [roundAtt.id] }, 201)).settlement;
+  check('逐登记逐人四舍五入到分（100 分/时 × 100 秒 / 3600 = 2.777… -> 3 分）',
+    roundSet.entries[0].durationSeconds === 100 && roundSet.entries[0].amountCents === 3
+    && roundSet.total.cents === 3, JSON.stringify(roundSet.entries));
+  await J('/api/settlements', director, { attendanceSessionIds: [roundAtt.id] }, 409);
+  check('已结算登记再次提交 409（与未关闭/已作废互斥的已结算分支）', true);
+
+  console.log('— 劳务结算：生成多登记结算单并冻结 —');
+  // PAY1/PAY2/PAY3 一单：林晚费率已改为 100（冻结“结算时费率”）；陈默 45000；周海 1000
+  const paySet = (await J('/api/settlements', director, {
+    attendanceSessionIds: [pay1.id, pay2.id, pay3.id], note: '六月批次',
+  }, 201)).settlement;
+  const byActor = Object.fromEntries(paySet.actorTotals.map((a) => [a.actorId, a.totalCents]));
+  check('多登记合并：缺席不计费、关闭后取消仍计费、兼任多角只算一次',
+    paySet.entries.length === 4 // PAY1: 林晚/陈默；PAY2: 林晚；PAY3: 周海
+    && byActor[linId] === 100 * (3600 + 5400) / 3600 // 100 分/时 × 2.5 时 = 250
+    && byActor[chenId] === 45000
+    && byActor[zhouId] === 500
+    && paySet.total.cents === 250 + 45000 + 500,
+    JSON.stringify({ entries: paySet.entries.map((e) => ({ a: e.actorId, s: e.attendanceSessionId, amt: e.amountCents })), total: paySet.total }));
+  check('明细冻结时长与费率',
+    paySet.entries.every((e) => e.rateCentsPerHour === (e.actorId === linId ? 100 : e.actorId === chenId ? 45000 : 1000))
+    && paySet.entries.find((e) => e.attendanceSessionId === pay1.id).durationSeconds === 3600
+    && paySet.entries.find((e) => e.attendanceSessionId === pay2.id).durationSeconds === 5400
+    && paySet.entries.find((e) => e.attendanceSessionId === pay3.id).durationSeconds === 1800);
+  // 已结算不能重复
+  const again = await J('/api/settlements', director, { attendanceSessionIds: [pay1.id] }, 409);
+  check('已结算登记再次结算 409 SETTLEMENT_SESSION_ALREADY_SETTLED',
+    again.error === 'SETTLEMENT_SESSION_ALREADY_SETTLED' && again.details.settlementId === paySet.id);
+  const againMixed = await J('/api/settlements', director, { attendanceSessionIds: [pay2.id, roundAtt.id] }, 409);
+  check('一单中混入已结算登记同样整单拒绝（不占用新登记）',
+    againMixed.error === 'SETTLEMENT_SESSION_ALREADY_SETTLED');
+  // 登记/日程摘要带结算标记
+  const pay1View = (await G(`/api/rehearsals/${rhPay}/schedules/${schPay1.id}/attendance`, director)).session;
+  check('登记详情带 settled/settlementId', pay1View.settled === true && pay1View.settlementId === paySet.id);
+  const pay1Sched = (await G(`/api/rehearsals/${rhPay}/schedules`, director)).schedules.find((s) => s.id === schPay1.id);
+  check('导演日程摘要带 settled/settlementId',
+    pay1Sched.attendance.settled === true && pay1Sched.attendance.settlementId === paySet.id);
+  const eligAfter = (await G('/api/settlements/eligible-attendances', director)).sessions;
+  check('已结算登记移出可结算清单',
+    ![pay1.id, pay2.id, pay3.id, roundAtt.id].some((id) => eligAfter.some((s) => s.attendanceSessionId === id)));
+
+  console.log('— 劳务结算：冻结性（调期/改派/替角/费率变更/取消日程不改写）—');
+  // 费率再改
+  await req('PUT', `/api/actors/${linId}/rate`, director, { rateCentsPerHour: 999999 }, 200);
+  // PAY3 对应时段再调整（签到开启后调期不回写登记；这里验证结算单金额也不变）
+  await req('PATCH', `/api/rehearsals/${rhPay}/schedules/${schPay3.id}`, director, {
+    startAt: '2037-08-03T20:00:00+08:00', endAt: '2037-08-03T22:00:00+08:00',
+  }, 200);
+  // PAY1 改派（登记已开启，名单不回写；结算单同样不动）
+  await J(`/api/rehearsals/${rhPay}/cast`, director, { roleId: roleY, actorId: zhouId }, 200);
+  // PAY2 时段已取消（关闭后取消），再确认一次单据不变
+  const frozen = (await G(`/api/settlements/${paySet.id}`, director)).settlement;
+  check('费率变更/调期/改派后结算单金额、时长、费率完全不变',
+    frozen.total.cents === paySet.total.cents
+    && frozen.entries.length === 4
+    && frozen.entries.find((e) => e.actorId === linId).rateCentsPerHour === 100
+    && frozen.entries.find((e) => e.attendanceSessionId === pay3.id).durationSeconds === 1800,
+    JSON.stringify(frozen.total));
+  // 作废的登记依旧不能补结算（att3 在开放期取消）
+  await J('/api/settlements', director, { attendanceSessionIds: [att3.id, pay1.id] }, 400);
+
+  console.log('— 劳务结算：导演看整单合计、演员仅本人明细 —');
+  const full = (await G(`/api/settlements/${paySet.id}`, director)).settlement;
+  check('导演查看整单：登记/明细/逐人合计/总计齐全',
+    full.sessions.length === 3 && full.entries.length === 4
+    && full.actorTotals.length === 3
+    && full.total.cents === full.entries.reduce((s, e) => s + e.amountCents, 0),
+    JSON.stringify({ sessions: full.sessions.length, totals: full.actorTotals }));
+  const listDir = (await G('/api/settlements', director)).settlements;
+  check('导演结算单列表含两张单据与摘要',
+    listDir.length === 2 && listDir.every((s) => s.total && s.sessionCount >= 1 && s.actorCount >= 1),
+    JSON.stringify(listDir));
+  const linDetail = (await G(`/api/settlements/${paySet.id}`, lin)).settlement;
+  check('演员只见本人明细（无他人、无整单总计，含本人合计）',
+    linDetail.entries.length === 2
+    && linDetail.entries.every((e) => e.actorId === linId)
+    && linDetail.entries.some((e) => e.attendanceSessionId === pay1.id)
+    && linDetail.entries.some((e) => e.attendanceSessionId === pay2.id)
+    && linDetail.myTotal.cents === 250
+    && linDetail.total === undefined && linDetail.actorTotals === undefined
+    && linDetail.sessions === undefined,
+    JSON.stringify({ n: linDetail.entries.length, my: linDetail.myTotal }));
+  const linList = (await G('/api/settlements', lin)).settlements;
+  check('演员列表只见含本人的单据（两张：六月批次 + 四舍五入单）',
+    linList.length === 2 && linList.every((s) => s.myTotal),
+    JSON.stringify(linList));
+  // 陈默是 paySet 当事人（PAY1 签到），可见本人一条；周海在 paySet 与 PAY1 改派无影响（冻结）
+  const chenDetail = (await G(`/api/settlements/${paySet.id}`, chen)).settlement;
+  check('陈默只见自己一条明细（PAY1，缺席的 PAY2 无其条目）',
+    chenDetail.entries.length === 1 && chenDetail.entries[0].attendanceSessionId === pay1.id
+    && chenDetail.myTotal.cents === 45000);
+  // 非当事人：导演之外、不在任何明细中的演员 -> 403
+  const zhouPayDetail = await G(`/api/settlements/${paySet.id}`, zhou, 200);
+  check('周海作为当事人可看本人在 PAY3 的唯一明细',
+    zhouPayDetail.settlement.entries.length === 1
+    && zhouPayDetail.settlement.entries[0].attendanceSessionId === pay3.id);
+  await G('/api/settlements/99999', director, 404);
+  await G('/api/settlements/99999', lin, 404);
+  check('结算单不存在：导演/演员均 404', true);
+  // 四舍五入单据只有林晚，陈默访问 -> 403
+  await G(`/api/settlements/${roundSet.id}`, chen, 403);
+  check('非当事人演员访问他人结算单 403', true);
+
+  console.log('— 劳务结算：零费率与无人签到的已关闭登记 —');
+  // 周海费率改为 0 后，新登记由周海签到结算 -> 0 元
+  await req('PUT', `/api/actors/${zhouId}/rate`, director, { rateCentsPerHour: 0 }, 200);
+  const schZero = (await J(`/api/rehearsals/${rhPay}/schedules`, director, {
+    sceneId: at1, startAt: '2037-08-08T10:00:00+08:00', endAt: '2037-08-08T11:00:00+08:00',
+  }, 201)).schedule;
+  const zeroAtt = (await J(`/api/rehearsals/${rhPay}/schedules/${schZero.id}/attendance`, director, {}, 201)).session;
+  await J(`/api/rehearsals/${rhPay}/schedules/${schZero.id}/attendance/check-in`, zhou, {}, 201);
+  await J(`/api/rehearsals/${rhPay}/schedules/${schZero.id}/attendance/close`, director, {}, 200);
+  const zeroSet = (await J('/api/settlements', director, { attendanceSessionIds: [zeroAtt.id], note: '零元' }, 201)).settlement;
+  check('显式零费率可结算、金额 0', zeroSet.entries[0].rateCentsPerHour === 0 && zeroSet.total.cents === 0);
+  // 无人签到的已关闭登记：可结算、占用登记、单据 0 元无明细
+  const schEmpty = (await J(`/api/rehearsals/${rhPay}/schedules`, director, {
+    sceneId: at1, startAt: '2037-08-09T10:00:00+08:00', endAt: '2037-08-09T11:00:00+08:00',
+  }, 201)).schedule;
+  const emptyAtt = (await J(`/api/rehearsals/${rhPay}/schedules/${schEmpty.id}/attendance`, director, {}, 201)).session;
+  await J(`/api/rehearsals/${rhPay}/schedules/${schEmpty.id}/attendance/close`, director, {}, 200);
+  const emptySet = (await J('/api/settlements', director, { attendanceSessionIds: [emptyAtt.id], note: '无人签到' }, 201)).settlement;
+  check('无人签到的已关闭登记可生成 0 元空单且占用登记',
+    emptySet.entries.length === 0 && emptySet.total.cents === 0
+    && emptySet.sessions.length === 1);
+  await J('/api/settlements', director, { attendanceSessionIds: [emptyAtt.id] }, 409);
+  check('空单结算后该登记同样不可重复结算（409）', true);
+  // 非当事人看不到空单
+  await G(`/api/settlements/${emptySet.id}`, lin, 403);
+  check('无本人明细的空单对演员 403', true);
 
   console.log(failures === 0 ? '\n全部通过 🎉' : `\n${failures} 项失败`);
   process.exit(failures === 0 ? 0 : 1);

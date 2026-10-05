@@ -13,6 +13,7 @@ const { router: unavailabilityRouter } = require('./unavailability');
 const { router: notificationsRouter } = require('./notifications');
 const { router: propsRouter } = require('./props');
 const { router: substitutesRouter } = require('./substitutes');
+const { router: settlementsRouter } = require('./settlements');
 const { db } = require('./db');
 
 const PORT = Number(process.env.PORT || 3000);
@@ -46,6 +47,7 @@ app.use('/api', unavailabilityRouter);
 app.use('/api', notificationsRouter);
 app.use('/api', propsRouter);
 app.use('/api', substitutesRouter);
+app.use('/api', settlementsRouter);
 
 // 演员名册（仅导演）
 app.get(

@@ -375,3 +375,64 @@ CREATE TABLE IF NOT EXISTS prop_reservations (
 );
 CREATE INDEX IF NOT EXISTS idx_prop_reservations_prop ON prop_reservations(prop_id);
 CREATE INDEX IF NOT EXISTS idx_prop_reservations_schedule ON prop_reservations(schedule_id);
+
+-- 演员每小时劳务费率（导演维护，非负整数，单位：分/小时）。
+--   * 仅演员有费率；没有行 = 未设置费率（结算时整单拒绝），显式 0 = 费率为零，可正常结算为 0 元。
+--   * 费率可随时调整；结算单冻结的是“结算时费率”（settlement_entries.rate_cents_per_hour），
+--     之后改费率不影响已生成的结算单。
+CREATE TABLE IF NOT EXISTS actor_rates (
+  actor_id             INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+  rate_cents_per_hour  INTEGER NOT NULL CHECK (rate_cents_per_hour >= 0),
+  updated_by          INTEGER REFERENCES users(id),
+  created_at           TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at           TEXT
+);
+
+-- 劳务结算单：导演选择“多个已关闭（closed，且未作废）”的到场登记一次性生成。
+--   * 只有“已关闭”的登记可纳入；已作废（voided）不能结算；关闭后日程才取消的登记仍可结算。
+--   * 仅冻结名单中“已签到”的演员计费，兼任多角只算一次（每个 登记×演员 至多一条）。
+--   * 金额 = 登记冻结的 UTC 时段秒数 × 结算时费率 ÷ 3600，逐登记逐人四舍五入到分。
+--   * 无费率、重复选择或登记已结算 -> 整单拒绝，不占用任何登记（不写任何数据）。
+--   * 单据一旦生成即冻结登记、演员、时长、费率和金额；后续调期/改派/替角/费率变更/取消日程均不改写。
+CREATE TABLE IF NOT EXISTS settlements (
+  id           INTEGER PRIMARY KEY,
+  note         TEXT NOT NULL DEFAULT '',
+  status       TEXT NOT NULL DEFAULT 'final' CHECK (status IN ('final')),
+  total_cents  INTEGER NOT NULL DEFAULT 0,
+  created_by   INTEGER REFERENCES users(id),
+  created_at   TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+-- 结算单明细：一条 = 某结算单 × 某次已关闭登记 × 某个已签到演员（兼任多角仍只一条）。
+-- duration_seconds 取自登记冻结的 UTC 时段（attendance_sessions.start_at/end_at），
+-- rate_cents_per_hour 取自生成单据时的演员费率，amount_cents 已按规则四舍五入。
+-- 任一登记至多被结算一次：settlement_session_marks 以部分唯一约束强制占用。
+CREATE TABLE IF NOT EXISTS settlement_entries (
+  id                      INTEGER PRIMARY KEY,
+  settlement_id           INTEGER NOT NULL REFERENCES settlements(id) ON DELETE CASCADE,
+  attendance_session_id   INTEGER NOT NULL REFERENCES attendance_sessions(id),
+  schedule_id             INTEGER NOT NULL REFERENCES rehearsal_schedules(id),
+  rehearsal_id            INTEGER NOT NULL REFERENCES rehearsals(id),
+  scene_id                INTEGER NOT NULL REFERENCES scenes(id),
+  actor_id                INTEGER NOT NULL REFERENCES users(id),
+  duration_seconds        INTEGER NOT NULL CHECK (duration_seconds >= 0),
+  rate_cents_per_hour     INTEGER NOT NULL CHECK (rate_cents_per_hour >= 0),
+  amount_cents            INTEGER NOT NULL CHECK (amount_cents >= 0),
+  roles_json              TEXT NOT NULL DEFAULT '[]',
+  start_at                TEXT NOT NULL,
+  end_at                  TEXT NOT NULL,
+  UNIQUE (settlement_id, attendance_session_id, actor_id)
+);
+CREATE INDEX IF NOT EXISTS idx_settlement_entries_settlement ON settlement_entries(settlement_id);
+CREATE INDEX IF NOT EXISTS idx_settlement_entries_actor ON settlement_entries(actor_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_settlement_entries_session_actor
+  ON settlement_entries(attendance_session_id, actor_id);
+
+-- 登记“被结算单占用”标记：一个登记至多属于一张结算单（即使该登记无人签到也占一行）。
+-- 用独立表而非 attendance_sessions 加列，避免对只增快照式到场登记模块的写入耦合。
+CREATE TABLE IF NOT EXISTS settlement_session_marks (
+  attendance_session_id INTEGER PRIMARY KEY REFERENCES attendance_sessions(id) ON DELETE CASCADE,
+  settlement_id         INTEGER NOT NULL REFERENCES settlements(id) ON DELETE CASCADE,
+  created_at            TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_settlement_marks_settlement ON settlement_session_marks(settlement_id);
