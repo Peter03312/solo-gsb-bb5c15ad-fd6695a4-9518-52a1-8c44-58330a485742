@@ -375,3 +375,106 @@ CREATE TABLE IF NOT EXISTS prop_reservations (
 );
 CREATE INDEX IF NOT EXISTS idx_prop_reservations_prop ON prop_reservations(prop_id);
 CREATE INDEX IF NOT EXISTS idx_prop_reservations_schedule ON prop_reservations(schedule_id);
+
+-- 演员每小时劳务费率（导演维护，单位：分/小时，非负整数）。
+--   * 费率在“结算时”取值并冻结进结算明细；之后费率变更不影响已生成结算。
+--   * 未设置费率的演员参与计费时，整单拒绝（MISSING_ACTOR_RATE）。
+CREATE TABLE IF NOT EXISTS actor_rates (
+  id         INTEGER PRIMARY KEY,
+  actor_id   INTEGER NOT NULL UNIQUE REFERENCES users(id),
+  rate_cents INTEGER NOT NULL CHECK (rate_cents >= 0),
+  updated_by INTEGER REFERENCES users(id),
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+-- 劳务结算单：导演选择多个“已关闭（closed）”到场登记一次性生成。
+--   * 仅冻结名单中“已签到”者计费；同一登记内一人兼任多角只算一条（时长×费率÷3600，逐人逐登记四舍五入到分）。
+--   * 已作废（voided）登记不能结算；关闭后取消日程的登记（schedule_cancelled=1）仍可结算。
+--   * 单据一旦生成即冻结：登记、演员、时长、费率、金额均不可改写（触发器禁止 UPDATE/DELETE），
+--     后续调期、改派、替角、费率变更或取消日程均不影响本单。
+CREATE TABLE IF NOT EXISTS settlements (
+  id         INTEGER PRIMARY KEY,
+  note       TEXT NOT NULL DEFAULT '',
+  total_cents INTEGER NOT NULL DEFAULT 0,
+  created_by INTEGER REFERENCES users(id),
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+-- 结算单占用的到场登记：每张登记至多被一张结算单占用（唯一索引）。
+-- 失败的结算不写入本表——“整单拒绝，不占用任何登记”；包含零签到登记时也仅在此表留占用。
+-- 登记侧快照（UTC 时段、场次/排练/版本、状态与取消标注）一并冻结。
+CREATE TABLE IF NOT EXISTS settlement_attendances (
+  id                 INTEGER PRIMARY KEY,
+  settlement_id      INTEGER NOT NULL REFERENCES settlements(id) ON DELETE CASCADE,
+  attendance_id      INTEGER NOT NULL UNIQUE REFERENCES attendance_sessions(id),
+  schedule_id        INTEGER NOT NULL,
+  rehearsal_id       INTEGER NOT NULL,
+  scene_id           INTEGER NOT NULL,
+  version_id         INTEGER NOT NULL,
+  start_at           TEXT NOT NULL,
+  end_at             TEXT NOT NULL,
+  duration_seconds   INTEGER NOT NULL CHECK (duration_seconds >= 0),
+  attendance_status  TEXT NOT NULL,
+  schedule_cancelled INTEGER NOT NULL DEFAULT 0,
+  checked_in_count   INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_settlement_attendances_settlement
+  ON settlement_attendances(settlement_id);
+
+-- 结算明细：每张登记 × 每名已签到演员一行（兼任多角合并，roles_json 冻结其在冻结名单上的全部角色）。
+-- amount_cents = round_half_up(duration_seconds × rate_cents / 3600)，逐行四舍五入；
+-- 单据合计 = 明细金额之和。费率为结算时快照，金额与时长随后不可改写。
+CREATE TABLE IF NOT EXISTS settlement_items (
+  id                        INTEGER PRIMARY KEY,
+  settlement_id             INTEGER NOT NULL REFERENCES settlements(id) ON DELETE CASCADE,
+  settlement_attendance_id  INTEGER NOT NULL REFERENCES settlement_attendances(id) ON DELETE CASCADE,
+  attendance_id             INTEGER NOT NULL,
+  schedule_id               INTEGER NOT NULL,
+  rehearsal_id              INTEGER NOT NULL,
+  scene_id                  INTEGER NOT NULL,
+  version_id                INTEGER NOT NULL,
+  actor_id                  INTEGER NOT NULL,
+  actor_name                TEXT NOT NULL,
+  roles_json                TEXT NOT NULL DEFAULT '[]',
+  start_at                  TEXT NOT NULL,
+  end_at                    TEXT NOT NULL,
+  duration_seconds          INTEGER NOT NULL CHECK (duration_seconds >= 0),
+  rate_cents                INTEGER NOT NULL CHECK (rate_cents >= 0),
+  amount_cents              INTEGER NOT NULL CHECK (amount_cents >= 0),
+  checked_in_at             TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_settlement_items_settlement ON settlement_items(settlement_id);
+CREATE INDEX IF NOT EXISTS idx_settlement_items_actor ON settlement_items(actor_id);
+
+-- 触发器：结算单及其占用/明细一旦生成即冻结，严禁 UPDATE / DELETE
+CREATE TRIGGER IF NOT EXISTS trg_settlements_no_update
+BEFORE UPDATE ON settlements
+BEGIN
+  SELECT RAISE(ABORT, '劳务结算单不可改写');
+END;
+CREATE TRIGGER IF NOT EXISTS trg_settlements_no_delete
+BEFORE DELETE ON settlements
+BEGIN
+  SELECT RAISE(ABORT, '劳务结算单不可删除');
+END;
+CREATE TRIGGER IF NOT EXISTS trg_settlement_attendances_no_update
+BEFORE UPDATE ON settlement_attendances
+BEGIN
+  SELECT RAISE(ABORT, '结算单占用的登记记录不可改写');
+END;
+CREATE TRIGGER IF NOT EXISTS trg_settlement_attendances_no_delete
+BEFORE DELETE ON settlement_attendances
+BEGIN
+  SELECT RAISE(ABORT, '结算单占用的登记记录不可删除');
+END;
+CREATE TRIGGER IF NOT EXISTS trg_settlement_items_no_update
+BEFORE UPDATE ON settlement_items
+BEGIN
+  SELECT RAISE(ABORT, '劳务结算明细不可改写');
+END;
+CREATE TRIGGER IF NOT EXISTS trg_settlement_items_no_delete
+BEFORE DELETE ON settlement_items
+BEGIN
+  SELECT RAISE(ABORT, '劳务结算明细不可删除');
+END;

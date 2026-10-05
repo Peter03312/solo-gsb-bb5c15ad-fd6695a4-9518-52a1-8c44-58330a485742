@@ -184,6 +184,28 @@
 7. **演员只可查看自己当前参与的有效时段的道具清单**（仅道具名称与本时段件数，不见库存、余量与其他预约）；
    非参与时段、待调整/已取消时段、登记册与任何写入接口均 `403`。演员与导演的日程列表均带 `props` 简表。
 
+### 演员劳务结算（按已关闭到场登记）
+
+1. 导演维护**每名演员的每小时费率**：单位为**分/小时**，必须是**非负整数**；未设置费率的演员
+   `rateCents=null`。费率在**结算那一刻取值**并冻结进明细，之后调整费率不影响已生成单据。
+2. 导演一次选择**多个已关闭（`closed`）登记**生成一张结算单（`POST /api/settlements`）：
+   - **已作废（`voided`）登记不能结算**；开放中（`open`）登记不能结算；
+   - **关闭后取消日程的登记仍可结算**（`scheduleCancelled=true`，照常取关闭时统计）；
+   - **仅冻结名单中已签到者计费**；未签到（缺席）者不计；
+   - **兼任多角只算一次**：同一登记冻结名单中一名演员只有一条明细（`roles` 含其全部角色）。
+3. 金额：**登记冻结的 UTC 时段秒数 × 结算时费率 ÷ 3600，逐人（每条明细）四舍五入到分**
+   （半数向上，BigInt 整数运算）；单据**合计 = 各明细金额之和**。
+4. **整单拒绝**的情形（任一不满足，整次操作不写入、回滚、**不占用任何登记**）：
+   - 某计费演员**无费率** → `409 MISSING_ACTOR_RATE`（`details` 指出登记与演员）；
+   - 请求内**重复选择**同一登记 → `400`（`details.duplicates`）；
+   - 登记**已被其他结算单结算** → `409 ATTENDANCE_ALREADY_SETTLED`；
+   - 登记不存在 `404`；未关闭/已作废 `400`。被拒后补设费率即可用原登记重新结算。
+5. 单据一旦生成即**冻结**：登记、演员、UTC 时长、费率、金额与登记状态快照均落库，
+   数据库触发器禁止 `UPDATE/DELETE`；后续**调期、改派、替角、费率变更或取消日程均不改写**。
+   零签到的已关闭登记也可结算（占用一条登记、金额为 0）。
+6. **可见性**：导演可查看结算单列表与任意整单（登记快照、全部明细、按演员汇总与合计）；
+   演员只能查看**本人明细**（列表只列含本人的单、不给整单合计；无本人明细的单 `403`）。
+
 ## 一键启动（Docker，推荐）
 
 前置：已安装 Docker 与 Docker Compose v2。
@@ -250,6 +272,9 @@ PORT=8080 docker compose up --build -d
 | 演员 | `lin` | `actor123` | 林晚，饰演《夜航灯塔》守塔人 |
 | 演员 | `chen` | `actor123` | 陈默，饰演船员 |
 | 演员 | `zhou` | `actor123` | 周海，初始未派角 |
+
+> 演示数据中已维护劳务费率：林晚 120 元/小时、陈默 100 元/小时（12000/10000 分）；**周海初始无费率**，
+> 用其已签到的已关闭登记结算会得到 `409 MISSING_ACTOR_RATE`，导演补设费率后即可结算。
 
 演示数据包含剧本《夜航灯塔》（2 个场次、2 个角色、7 句台词，已发布 v1）和一个固定 v1 的排练
 （含一段 2026-10-10 的示例日程，该日程自带一条待林晚、陈默知悉确认的时段通知批次；
@@ -326,12 +351,17 @@ PORT=8080 docker compose up --build -d
 | PATCH | `/api/props/:propId` | 调整道具总量/改名（导演；下调时校验全部有效预约，不足整次不生效） |
 | GET/PUT | `/api/rehearsals/:id/schedules/:sid/props` | 查看时段预约与最低余量（演员仅限本人参与的有效时段且只见清单）/ 填写道具目标件数（导演；`quantity=0` 撤销，未列出的道具不变） |
 | POST | `/api/schedules/props/batch` | 批量修改多个时段的道具预约（导演，至少两条，可跨排练）：整批最终状态校验，任一时刻不足整批不生效，返回道具/冲突时段/缺口 |
+| GET | `/api/actors/rates` | 演员费率名册（导演；未设置者 `rateCents=null`） |
+| PUT | `/api/actors/:actorId/rate` | 设置/调整演员每小时费率（导演；`rateCents` 非负整数，单位分） |
+| POST | `/api/settlements` | 生成劳务结算单（导演）：`attendanceIds` 多个已关闭登记；无费率/重复选择/已结算/已作废整单拒绝且不占用 |
+| GET | `/api/settlements` · `/api/settlements/:id` | 结算单列表 / 整单详情（导演见全部明细与合计；演员仅本人明细，无本人明细 403） |
 | GET | `/api/dashboard` | 导演总览 |
 
 错误统一形如 `{ "error": "CODE", "message": "...", "details": ... }`，
 典型状态码：`400`（无效版本/场次/参数、状态不允许的操作）、`401`（未登录）、`403`（越权）、`404`（不存在）、
 `409`（业务冲突，如 `OLD_TEXT_MISMATCH`、`PUBLISH_CONFLICT`、`SCHEDULE_CONFLICT`、
-`UNAVAILABILITY_CONFLICT`、`ATTENDANCE_EXISTS`、`ATTENDANCE_NOT_OPEN`、`NOTIFICATION_EXPIRED`、`PREVIEW_STALE`、`PROP_CAPACITY_CONFLICT`、`ATTENDANCE_FROZEN`）。
+`UNAVAILABILITY_CONFLICT`、`ATTENDANCE_EXISTS`、`ATTENDANCE_NOT_OPEN`、`NOTIFICATION_EXPIRED`、`PREVIEW_STALE`、`PROP_CAPACITY_CONFLICT`、`ATTENDANCE_FROZEN`、
+`MISSING_ACTOR_RATE`、`ATTENDANCE_ALREADY_SETTLED`）。
 
 日程列表响应（导演与演员）均带 `notification` 摘要：导演见 `{id, seq, status, expected, confirmed, pending}`
 （仅当前批次计 `pending`）；演员见 `{id, seq, myState, confirmedAt}`（本人不在当前批次接收人中或无批次时为 `null`）。
@@ -875,6 +905,77 @@ curl -s http://localhost:3000/api/rehearsals/1/schedules/1/temp-lines \
 #      取消或待调整期间不占用演员，恢复有效后须重新设置（换版预演响应含 substitutesInvalidated）。
 ```
 
+## 演员劳务结算接口调用示例（curl）
+
+```bash
+# 1. 导演登录，拿到 token
+curl -s -X POST http://localhost:3000/api/login \
+  -H 'Content-Type: application/json' \
+  -d '{"username":"director","password":"director123"}'
+# -> {"token":"<TOKEN>",...}
+
+# 2. 查看演员费率名册（分/小时；未维护费率者 rateCents=null）
+curl -s http://localhost:3000/api/actors/rates -H "Authorization: Bearer <TOKEN>"
+# -> {"actors":[
+#      {"actorId":2,"actorUsername":"lin","actorName":"林晚","rateCents":12000,"updatedAt":"..."},
+#      {"actorId":3,"actorUsername":"chen","actorName":"陈默","rateCents":10000,"updatedAt":"..."},
+#      {"actorId":4,"actorUsername":"zhou","actorName":"周海","rateCents":null,"updatedAt":null}]}
+
+# 3. 设置/调整费率（非负整数，单位分；负数/小数 400，非演员 id 404，演员调用 403）
+curl -s -X PUT http://localhost:3000/api/actors/4/rate \
+  -H "Authorization: Bearer <TOKEN>" -H 'Content-Type: application/json' \
+  -d '{"rateCents":9000}'
+# -> {"ok":true,"actor":{"actorId":4,"actorName":"周海","rateCents":9000}}
+
+# 4. 先按“到场登记”流程拿到多个“已关闭”登记的 id（开启→签到→关闭）：
+#    POST /api/rehearsals/:id/schedules/:sid/attendance
+#    POST .../attendance/check-in（演员；仅冻结名单中已签到者计费）
+#    POST .../attendance/close
+
+# 5. 选择多个已关闭登记生成结算单
+curl -s -X POST http://localhost:3000/api/settlements \
+  -H "Authorization: Bearer <TOKEN>" -H 'Content-Type: application/json' \
+  -d '{"attendanceIds":[3,5],"note":"2月第一批"}'
+# -> 201 {"settlement":{
+#      "id":1,"note":"2月第一批","totalCents":40000,"lineCount":3,"attendanceCount":2,
+#      "attendances":[{"attendanceId":3,"scheduleId":4,"rehearsalId":2,"sceneTitle":"结算场",
+#        "versionNo":1,"startAt":"2035-02-01T02:00:00.000Z","endAt":"2035-02-01T03:00:00.000Z",
+#        "durationSeconds":3600,"attendanceStatus":"closed","scheduleCancelled":false,
+#        "checkedInCount":2}, ...],
+#      "items":[{"attendanceId":3,"actorId":2,"actorName":"林晚",
+#        "roles":[{"roleId":1,"roleName":"守塔人",...}],"durationSeconds":3600,
+#        "rateCents":12000,"amountCents":12000,"checkedInAt":"..."}, ...],
+#      "byActor":[{"actorId":2,"actorName":"林晚","durationSeconds":7200,
+#                  "amountCents":24000,"lineCount":2}, ...]}}
+#    - 金额 = 登记冻结的 UTC 时段秒数 × 结算时费率 ÷ 3600，逐人四舍五入到分（半数向上）；
+#    - 兼任多角在同一登记只有一条明细（roles 含全部角色）；缺席者不计；
+#    - 关闭后取消日程的登记仍可结算（attendanceStatus="closed", scheduleCancelled=true）。
+
+# 6. 整单拒绝（全部在写入前拒绝，事务回滚，不占用任何登记）：
+#    - 请求内重复选择：400 {"error":"BAD_REQUEST",
+#        "message":"批次中存在重复选择的登记 #3","details":{"duplicates":[3]}}
+#    - 登记未关闭/已作废：400（message 指出登记 id 与现状）
+#    - 已在其他结算单：409 {"error":"ATTENDANCE_ALREADY_SETTLED",
+#        "details":{"attendanceId":3,"settlementId":1}}
+#    - 计费演员无费率：409 {"error":"MISSING_ACTOR_RATE",
+#        "message":"演员「周海」尚未设置每小时费率，请先维护费率后再结算",
+#        "details":{"attendanceId":5,"actorId":4}}
+#      —— 补设费率后用同一批登记重新结算即可（被拒时未占用）。
+#    - 登记不存在 404；attendanceIds 缺失/空/非正整数 400；演员调用 403。
+
+# 7. 导演查看列表与整单（含合计 totalCents 与 byActor 汇总）
+curl -s http://localhost:3000/api/settlements -H "Authorization: Bearer <TOKEN>"
+curl -s http://localhost:3000/api/settlements/1 -H "Authorization: Bearer <TOKEN>"
+
+# 8. 演员只看本人明细（列表不含整单合计；详情只含本人条目与其涉及的登记快照）
+curl -s http://localhost:3000/api/settlements -H "Authorization: Bearer <ACTOR_TOKEN>"
+# -> {"settlements":[{"id":1,"note":"2月第一批","myLineCount":2,"myTotalCents":24000,...}]}
+curl -s http://localhost:3000/api/settlements/1 -H "Authorization: Bearer <ACTOR_TOKEN>"
+# -> {"settlement":{"id":1,...,"myLineCount":2,"myTotalCents":24000,
+#      "attendances":[...仅本人明细涉及的登记...],"items":[...仅本人...]}}
+#    无本人明细的结算单 -> 403；单据生成后调期/改派/替角/改费率/取消日程均不改写其内容。
+```
+
 ## 测试
 
 端到端测试会用临时数据目录自动起停服务器，覆盖：认证与越权、修订原文校验、
@@ -899,7 +1000,11 @@ curl -s http://localhost:3000/api/rehearsals/1/schedules/1/temp-lines \
 临时替角（设置/替换/撤回与最终参与者返回；无效时段/角色/非演员/本人替补/缺原因拒绝；同角色同时段一个替角；
 只改本时段参与者/通知接收人/替角本场台词而不改常驻派角与逐场确认、权限不外延；
 设置/撤回按最终名单检查时段与本人不可用重叠、端点相接、冲突整体不生效；改派/调期/取消/换版后失去台词或原派角变化即失效并重校验、
-取消待调整不占用、恢复有效重新设置；接收人或角色变化才重发通知、旧批次留历史；签到开启后冻结不回写）等：
+取消待调整不占用、恢复有效重新设置；接收人或角色变化才重发通知、旧批次留历史；签到开启后冻结不回写）、
+演员劳务结算（费率非负整数校验与越权、仅已关闭登记可结算、作废拒绝而关闭后取消可结算、
+仅冻结名单已签到者计费且兼任多角只算一次、UTC 秒数×费率÷3600 逐人四舍五入到分与合计、
+无费率/重复选择/已结算整单拒绝且不占用（补设费率后原登记可结算）、零签到登记结算与占用、
+导演整单/按演员汇总与演员仅本人明细的可见性、调期/改派/费率变更/取消后单据冻结、防改写触发器）等：
 
 ```bash
 npm test
@@ -927,6 +1032,9 @@ src/
                    容量冲突（道具/冲突时段/缺口）、调期集成校验、演员可见性
   substitutes.js   单时段临时替角：设置/替换/撤回（签到开启前）、最终参与者返回、替角本场台词；
                    失效与重校验由 schedules.js/rehearsals.js 在调期/改派/换版/取消事务内完成
+  settlements.js   演员劳务结算：演员每小时费率（分，非负整数）、按多个已关闭到场登记生成结算单
+                   （仅冻结名单已签到者计费、兼任多角一次、秒数×费率÷3600 逐人四舍五入到分、
+                    无费率/重复/已结算整单拒绝不占用、单据冻结不可改写、导演整单与演员本人视图）
   server.js        Express 入口
 public/            原生 JS 单页前端
 scripts/           安装兜底脚本与端到端测试

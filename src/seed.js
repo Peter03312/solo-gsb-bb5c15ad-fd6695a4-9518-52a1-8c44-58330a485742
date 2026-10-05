@@ -85,6 +85,10 @@ function seed() {
     );
     insRes.run(seedSchedule, propLamp, 1, director);
     insRes.run(seedSchedule, propSword, 1, director);
+
+    // 演员每小时劳务费率（分/小时）；周海初始未设置费率（结算时整单拒绝，需导演先维护）
+    db.prepare('INSERT INTO actor_rates (actor_id, rate_cents, updated_by) VALUES (?, ?, ?)').run(lin, 12000, director);
+    db.prepare('INSERT INTO actor_rates (actor_id, rate_cents, updated_by) VALUES (?, ?, ?)').run(chen, 10000, director);
   });
 
   return true;
